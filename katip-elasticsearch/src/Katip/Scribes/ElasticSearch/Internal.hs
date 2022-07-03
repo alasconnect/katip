@@ -78,7 +78,8 @@ data EsScribeCfg v = EsScribeCfg
     -- bloodhound module, either @Database.V1.Bloodhound@ or
     -- @Database.V5.Bloodhound@
     essIndexSettings :: IndexSettings v,
-    essIndexSharding :: IndexShardingPolicy
+    essIndexSharding :: IndexShardingPolicy,
+    essOverwriteTemplate :: Bool
   }
   deriving (Typeable)
 
@@ -103,7 +104,8 @@ defaultEsScribeCfg' prx =
       essPoolSize = EsPoolSize 2,
       essAnnotateTypes = False,
       essIndexSettings = defaultIndexSettings prx,
-      essIndexSharding = DailyIndexSharding
+      essIndexSharding = DailyIndexSharding,
+      essOverwriteTemplate = False
     }
 
 -------------------------------------------------------------------------------
@@ -272,10 +274,15 @@ mkEsScribe cfg@EsScribeCfg {..} env ix permit verb = do
   runBH prx env $ do
     if shardingEnabled
       then do
-        -- create or update
-        res <- putTemplate prx tpl tplName
-        unless (statusIsSuccessful (responseStatus res)) $
-          liftIO $ EX.throwIO (CouldNotPutTemplate res)
+        -- Don't Replace existing template
+        tplExists <- templateExists prx tplName
+        case (tplExists, essOverwriteTemplate) of
+          (True, False) -> return ()
+          (_, _) -> do
+            -- create or update
+            res <- putTemplate prx tpl tplName
+            unless (statusIsSuccessful (responseStatus res)) $
+              liftIO $ EX.throwIO (CouldNotPutTemplate res)
       else do
         ixExists <- indexExists prx ix
         if ixExists
@@ -324,44 +331,9 @@ mkEsScribe cfg@EsScribeCfg {..} env ix permit verb = do
 
 -------------------------------------------------------------------------------
 baseMapping :: ESVersion v => proxy v -> Value
-baseMapping prx =
-   object ["properties" .= object prs]
-  where
-    prs =
-      [ unanalyzedString "thread",
-        unanalyzedString "sev",
-        unanalyzedString "pid",
-        -- ns is frequently fulltext searched
-        analyzedString "ns",
-        -- we want message to be fulltext searchable
-        analyzedString "msg",
-        "loc" .= locType,
-        unanalyzedString "host",
-        unanalyzedString "env",
-        "at" .= dateType,
-        unanalyzedString "app"
-      ]
-    unanalyzedString k = k .= unanalyzedStringSpec prx
-    analyzedString k = k .= analyzedStringSpec prx
-    locType = object ["properties" .= object locPairs]
-    locPairs =
-      [ unanalyzedString "loc_pkg",
-        unanalyzedString "loc_mod",
-        unanalyzedString "loc_ln",
-        unanalyzedString "loc_fn",
-        unanalyzedString "loc_col"
-      ]
-    dateType =
-      object
-        [ "format" .= esDateFormat,
-          "type" .= String "date"
-        ]
+baseMapping _prx =
+   object []
 
--------------------------------------------------------------------------------
-
--- | Handle both old-style aeson and picosecond-level precision
-esDateFormat :: Text
-esDateFormat = "yyyy-MM-dd'T'HH:mm:ssZ||yyyy-MM-dd'T'HH:mm:ss.SSSZ||yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSZ"
 
 -------------------------------------------------------------------------------
 mkDocId :: ESVersion v => proxy v -> IO (DocId v)
@@ -463,6 +435,7 @@ class ESVersion v where
   -- Operations
   -- We're deciding on IO here, but it isn't necessary
   indexExists :: proxy v -> IndexName v -> BH v IO Bool
+  templateExists :: proxy v -> TemplateName v -> BH v IO Bool
   indexDocument :: ToJSON doc => proxy v -> IndexName v -> IndexDocumentSettings v -> doc -> DocId v -> BH v IO (Response ByteString)
   createIndex :: proxy v -> IndexSettings v -> IndexName v -> BH v IO (Response ByteString)
   updateIndexSettings :: proxy v -> NonEmpty (UpdatableIndexSetting v) -> IndexName v -> BH v IO (Response ByteString)
@@ -499,6 +472,7 @@ instance ESVersion ESV7 where
     (V7.NumberOfReplicas (V7.indexReplicas s)) :| []
   defaultIndexDocumentSettings _ = V7.defaultIndexDocumentSettings
   indexExists _ = V7.indexExists
+  templateExists _ = V7.templateExists
   indexDocument _ = V7.indexDocument
   createIndex _ = V7.createIndex
   updateIndexSettings _ = V7.updateIndexSettings
