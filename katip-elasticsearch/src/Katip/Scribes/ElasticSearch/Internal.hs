@@ -361,7 +361,7 @@ baseMapping prx =
 
 -- | Handle both old-style aeson and picosecond-level precision
 esDateFormat :: Text
-esDateFormat = "yyyy-MM-dd'T'HH:mm:ssZ||yyyy-MM-dd'T'HH:mm:ss.SSSZ||yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSSSSZ"
+esDateFormat = "yyyy-MM-dd'T'HH:mm:ssZ||yyyy-MM-dd'T'HH:mm:ss.SSSZ||yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSZ"
 
 -------------------------------------------------------------------------------
 mkDocId :: ESVersion v => proxy v -> IO (DocId v)
