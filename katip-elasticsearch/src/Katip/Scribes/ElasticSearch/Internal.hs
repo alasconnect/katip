@@ -39,12 +39,7 @@ import Data.Time.Calendar.WeekDate
 import Data.Typeable as Typeable
 import Data.UUID
 import qualified Data.UUID.V4 as UUID4
-#if MIN_VERSION_bloodhound(0,17,0)
-import qualified Database.Bloodhound                  as V5
-#else
-import qualified Database.V1.Bloodhound                  as V1
-import qualified Database.V5.Bloodhound                  as V5
-#endif
+import qualified Database.Bloodhound                  as V7
 
 -------------------------------------------------------------------------------
 import Katip.Core
@@ -113,24 +108,19 @@ defaultEsScribeCfg' prx =
 
 -------------------------------------------------------------------------------
 
--- | Alias of 'defaultEsScribeCfgV5' to minimize API
+-- | Alias of 'defaultEsScribeCfgV7' to minimize API
 -- breakage. Previous versions of katip-elasticsearch only supported
 -- ES version 1 and defaulted to it.
-defaultEsScribeCfg :: EsScribeCfg ESV5
-defaultEsScribeCfg = defaultEsScribeCfgV5
-
--------------------------------------------------------------------------------
-#if !MIN_VERSION_bloodhound(0,17,0)
--- | EsScribeCfg that will use ElasticSearch V1
-defaultEsScribeCfgV1 :: EsScribeCfg ESV1
-defaultEsScribeCfgV1 = defaultEsScribeCfg' (Typeable.Proxy :: Typeable.Proxy ESV1)
-#endif
+defaultEsScribeCfg :: EsScribeCfg ESV7
+defaultEsScribeCfg = defaultEsScribeCfgV7
 
 -------------------------------------------------------------------------------
 
--- | EsScribeCfg that will use ElasticSearch V5
-defaultEsScribeCfgV5 :: EsScribeCfg ESV5
-defaultEsScribeCfgV5 = defaultEsScribeCfg' (Typeable.Proxy :: Typeable.Proxy ESV5)
+-------------------------------------------------------------------------------
+
+-- | EsScribeCfg that will use ElasticSearch V7
+defaultEsScribeCfgV7 :: EsScribeCfg ESV7
+defaultEsScribeCfgV7 = defaultEsScribeCfg' (Typeable.Proxy :: Typeable.Proxy ESV7)
 
 -------------------------------------------------------------------------------
 
@@ -272,11 +262,10 @@ mkEsScribe ::
   BHEnv v ->
   -- | Treated as a prefix if index sharding is enabled
   IndexName v ->
-  MappingName v ->
   PermitFunc ->
   Verbosity ->
   IO Scribe
-mkEsScribe cfg@EsScribeCfg {..} env ix mapping permit verb = do
+mkEsScribe cfg@EsScribeCfg {..} env ix permit verb = do
   q <- newTBMQueueIO $ unEsQueueSize essQueueSize
   endSig <- newEmptyMVar
 
@@ -298,14 +287,14 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping permit verb = do
             r1 <- createIndex prx essIndexSettings ix
             unless (statusIsSuccessful (responseStatus r1)) $
               liftIO $ EX.throwIO (CouldNotCreateIndex r1)
-            r2 <- putMapping prx ix mapping base
+            r2 <- putMapping prx ix base
             unless (statusIsSuccessful (responseStatus r2)) $
               liftIO $ EX.throwIO (CouldNotCreateMapping r2)
 
   workers <-
     replicateM (unEsPoolSize essPoolSize) $
       async $
-        startWorker cfg env mapping q
+        startWorker cfg env q
 
   _ <- async $ do
     takeMVar endSig
@@ -325,8 +314,8 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping permit verb = do
     shardingEnabled = case essIndexSharding of
       NoIndexSharding -> False
       _ -> True
-    tpl = toIndexTemplate prx (toTemplatePattern prx (ixn <> "-*")) (Just essIndexSettings) [toJSON base]
-    base = baseMapping prx mapping
+    tpl = toIndexTemplate prx [(toIndexPattern prx (ixn <> "-*"))] (Just essIndexSettings) (toJSON base)
+    base = baseMapping prx
     ixn = fromIndexName prx ix
     itemJson' :: LogItem a => Item a -> Value
     itemJson' i
@@ -334,9 +323,9 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping permit verb = do
       | otherwise = itemJson verb i
 
 -------------------------------------------------------------------------------
-baseMapping :: ESVersion v => proxy v -> MappingName v -> Value
-baseMapping prx mn =
-  object [fromMappingName prx mn .= object ["properties" .= object prs]]
+baseMapping :: ESVersion v => proxy v -> Value
+baseMapping prx =
+   object ["properties" .= object prs]
   where
     prs =
       [ unanalyzedString "thread",
@@ -416,10 +405,9 @@ startWorker ::
   (ESVersion v) =>
   EsScribeCfg v ->
   BHEnv v ->
-  MappingName v ->
   TBMQueue (IndexName v, Value) ->
   IO ()
-startWorker EsScribeCfg {..} env mapping q = go
+startWorker EsScribeCfg {..} env q = go
   where
     go = do
       popped <- atomically $ readTBMQueue q
@@ -435,7 +423,7 @@ startWorker EsScribeCfg {..} env mapping q = go
       recovering essRetryPolicy [handler] $
         const $ do
           did <- mkDocId prx
-          res <- runBH prx env $ indexDocument prx ixn mapping (defaultIndexDocumentSettings prx) v did
+          res <- runBH prx env $ indexDocument prx ixn (defaultIndexDocumentSettings prx) v did
           return res
     eat _ = return ()
     handler _ = Handler $ \e ->
@@ -457,18 +445,16 @@ class ESVersion v where
   type IndexName v
   toIndexName :: proxy v -> Text -> IndexName v
   fromIndexName :: proxy v -> IndexName v -> Text
-  type MappingName v
-  fromMappingName :: proxy v -> MappingName v -> Text
   type DocId v
   toDocId :: proxy v -> Text -> DocId v
   type BH v :: (* -> *) -> * -> *
   runBH :: proxy v -> BHEnv v -> BH v m a -> m a
   type TemplateName v
   toTemplateName :: proxy v -> Text -> TemplateName v
-  type TemplatePattern v
-  toTemplatePattern :: proxy v -> Text -> TemplatePattern v
+  type IndexPattern v
+  toIndexPattern :: proxy v -> Text -> IndexPattern v
   type IndexTemplate v
-  toIndexTemplate :: proxy v -> TemplatePattern v -> Maybe (IndexSettings v) -> [Value] -> IndexTemplate v
+  toIndexTemplate :: proxy v -> [IndexPattern v] -> Maybe (IndexSettings v) -> Value -> IndexTemplate v
   type IndexDocumentSettings v
   defaultIndexDocumentSettings :: proxy v -> IndexDocumentSettings v
 
@@ -477,94 +463,47 @@ class ESVersion v where
   -- Operations
   -- We're deciding on IO here, but it isn't necessary
   indexExists :: proxy v -> IndexName v -> BH v IO Bool
-  indexDocument :: ToJSON doc => proxy v -> IndexName v -> MappingName v -> IndexDocumentSettings v -> doc -> DocId v -> BH v IO (Response ByteString)
+  indexDocument :: ToJSON doc => proxy v -> IndexName v -> IndexDocumentSettings v -> doc -> DocId v -> BH v IO (Response ByteString)
   createIndex :: proxy v -> IndexSettings v -> IndexName v -> BH v IO (Response ByteString)
   updateIndexSettings :: proxy v -> NonEmpty (UpdatableIndexSetting v) -> IndexName v -> BH v IO (Response ByteString)
   putTemplate :: proxy v -> IndexTemplate v -> TemplateName v -> BH v IO (Response ByteString)
-  putMapping :: (ToJSON a) => proxy v -> IndexName v -> MappingName v -> a -> BH v IO (Response ByteString)
+  putMapping :: (ToJSON a) => proxy v -> IndexName v -> a -> BH v IO (Response ByteString)
 
   -- In ES 5 and beyond, "string" was deprecated in favor of text for
   -- fulltext and keyword for unanalyzed tokens
   unanalyzedStringSpec :: proxy v -> Value
   analyzedStringSpec :: proxy v -> Value
 
-#if !MIN_VERSION_bloodhound(0,17,0)
-data ESV1 = ESV1
-{-# DEPRECATED ESV1 "ESV1 is deprecated and removed in bloodhound >= 0.17.0" #-}
+data ESV7 = ESV7
 
-
-instance ESVersion ESV1 where
-  type BHEnv ESV1 = V1.BHEnv
-  type IndexSettings ESV1 = V1.IndexSettings
-  defaultIndexSettings _ = V1.defaultIndexSettings
-  type IndexName ESV1 = V1.IndexName
-  type UpdatableIndexSetting ESV1 = V1.UpdatableIndexSetting
-  toIndexName _ = V1.IndexName
-  fromIndexName _ (V1.IndexName x) = x
-  type MappingName ESV1 = V1.MappingName
-  fromMappingName _ (V1.MappingName x) = x
-  type DocId ESV1 = V1.DocId
-  toDocId _ = V1.DocId
-  type BH ESV1 = V1.BH
-  runBH _ = V1.runBH
-  type TemplateName ESV1 = V1.TemplateName
-  toTemplateName _ = V1.TemplateName
-  type TemplatePattern ESV1 = V1.TemplatePattern
-  toTemplatePattern _ = V1.TemplatePattern
-  type IndexTemplate ESV1 = V1.IndexTemplate
-  toIndexTemplate _ = V1.IndexTemplate
-  type IndexDocumentSettings ESV1 = V1.IndexDocumentSettings
+instance ESVersion ESV7 where
+  type BHEnv ESV7 = V7.BHEnv
+  type IndexSettings ESV7 = V7.IndexSettings
+  type UpdatableIndexSetting ESV7 = V7.UpdatableIndexSetting
+  defaultIndexSettings _ = V7.defaultIndexSettings
+  type IndexName ESV7 = V7.IndexName
+  toIndexName _ = V7.IndexName
+  fromIndexName _ (V7.IndexName x) = x
+  type DocId ESV7 = V7.DocId
+  toDocId _ = V7.DocId
+  type BH ESV7 = V7.BH
+  runBH _ = V7.runBH
+  type TemplateName ESV7 = V7.TemplateName
+  toTemplateName _ = V7.TemplateName
+  type IndexPattern ESV7 = V7.IndexPattern
+  toIndexPattern _ = V7.IndexPattern
+  type IndexTemplate ESV7 = V7.IndexTemplate
+  toIndexTemplate _ = V7.IndexTemplate
+  type IndexDocumentSettings ESV7 = V7.IndexDocumentSettings
   toUpdatabaleIndexSettings _ s =
-    (V1.NumberOfReplicas (V1.indexReplicas s)) :| []
-  defaultIndexDocumentSettings _ = V1.defaultIndexDocumentSettings
-  indexExists _ = V1.indexExists
-  indexDocument _ = V1.indexDocument
-  createIndex _ = V1.createIndex
-  updateIndexSettings _ = V1.updateIndexSettings
-  putTemplate _ = V1.putTemplate
-  putMapping _ = V1.putMapping
-  unanalyzedStringSpec _ = object
-    [ "type" .= String  "string"
-    , "index" .= String "not_analyzed"
-    ]
-  analyzedStringSpec _ = object
-    [ "type" .= String  "string"
-    , "index" .= String "analyzed"
-    ]
-#endif
-
-data ESV5 = ESV5
-
-instance ESVersion ESV5 where
-  type BHEnv ESV5 = V5.BHEnv
-  type IndexSettings ESV5 = V5.IndexSettings
-  type UpdatableIndexSetting ESV5 = V5.UpdatableIndexSetting
-  defaultIndexSettings _ = V5.defaultIndexSettings
-  type IndexName ESV5 = V5.IndexName
-  toIndexName _ = V5.IndexName
-  fromIndexName _ (V5.IndexName x) = x
-  type MappingName ESV5 = V5.MappingName
-  fromMappingName _ (V5.MappingName x) = x
-  type DocId ESV5 = V5.DocId
-  toDocId _ = V5.DocId
-  type BH ESV5 = V5.BH
-  runBH _ = V5.runBH
-  type TemplateName ESV5 = V5.TemplateName
-  toTemplateName _ = V5.TemplateName
-  type TemplatePattern ESV5 = V5.TemplatePattern
-  toTemplatePattern _ = V5.TemplatePattern
-  type IndexTemplate ESV5 = V5.IndexTemplate
-  toIndexTemplate _ = V5.IndexTemplate
-  type IndexDocumentSettings ESV5 = V5.IndexDocumentSettings
-  toUpdatabaleIndexSettings _ s =
-    (V5.NumberOfReplicas (V5.indexReplicas s)) :| []
-  defaultIndexDocumentSettings _ = V5.defaultIndexDocumentSettings
-  indexExists _ = V5.indexExists
-  indexDocument _ = V5.indexDocument
-  createIndex _ = V5.createIndex
-  updateIndexSettings _ = V5.updateIndexSettings
-  putTemplate _ = V5.putTemplate
-  putMapping _ = V5.putMapping
+    (V7.NumberOfReplicas (V7.indexReplicas s)) :| []
+  defaultIndexDocumentSettings _ = V7.defaultIndexDocumentSettings
+  indexExists _ = V7.indexExists
+  indexDocument _ = V7.indexDocument
+  createIndex _ = V7.createIndex
+  updateIndexSettings _ = V7.updateIndexSettings
+  putTemplate _ = V7.putTemplate
+  putMapping _ = V7.putMapping
   unanalyzedStringSpec _ =
     object
       [ "type" .= String "keyword"

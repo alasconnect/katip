@@ -71,18 +71,12 @@ module Katip.Scribes.ElasticSearch
     essIndexSettings,
     essIndexSharding,
     defaultEsScribeCfg,
-#if !MIN_VERSION_bloodhound(0,17,0)
-    , defaultEsScribeCfgV1
-#endif
-    defaultEsScribeCfgV5,
+    defaultEsScribeCfgV7,
 
     -- ** Version-Proxied APIS
     -- $versionproxies
     defaultEsScribeCfg',
-#if !MIN_VERSION_bloodhound(0,17,0)
-    , ESV1
-#endif
-    ESV5,
+    ESV7,
 
     -- * Utilities
     mkDocId,
